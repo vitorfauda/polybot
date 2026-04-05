@@ -3,6 +3,7 @@
 from fastapi import APIRouter
 from services.polymarket.client import PolymarketClient
 from services.news.pipeline import NewsPipeline
+from api.routes.trades import executor
 
 router = APIRouter()
 
@@ -60,15 +61,7 @@ async def dashboard_overview():
                 "avg_sentiment": round(avg_sentiment, 3),
                 "sentiment_label": "positive" if avg_sentiment > 0.05 else "negative" if avg_sentiment < -0.05 else "neutral",
             },
-            # Placeholder for portfolio (will come from DB later)
-            "portfolio": {
-                "total_balance": 0,
-                "invested": 0,
-                "available": 0,
-                "total_pnl": 0,
-                "win_rate": 0,
-                "total_trades": 0,
-            },
+            "portfolio": executor.get_portfolio(),
         }
     finally:
         await poly_client.close()

@@ -5,6 +5,7 @@ from services.polymarket.client import PolymarketClient
 from services.news.pipeline import NewsPipeline
 from services.analysis.scorer import OpportunityScorer
 from services.risk.kelly import KellySizer
+from services.analysis.llm_analyst import LLMAnalyst
 
 router = APIRouter()
 
@@ -108,6 +109,77 @@ async def scan_opportunities(
             })
 
         return {"opportunities": results, "total_scanned": len(markets)}
+    finally:
+        await poly_client.close()
+        await pipeline.close()
+
+
+@router.get("/llm/{condition_id}")
+async def llm_analyze_market(condition_id: str):
+    """Deep analysis of a specific market using Claude AI."""
+    poly_client = PolymarketClient()
+    pipeline = NewsPipeline()
+    analyst = LLMAnalyst()
+
+    try:
+        market = await poly_client.get_market(condition_id)
+        question = market.get("question", "")
+        news = await pipeline.collect_for_market(question, max_results=10)
+
+        # Try to get price history
+        price_history = None
+        tokens = market.get("clobTokenIds", "[]")
+        if isinstance(tokens, str):
+            import json
+            try:
+                tokens = json.loads(tokens)
+            except:
+                tokens = []
+        if tokens:
+            try:
+                price_history = await poly_client.get_price_history(tokens[0], interval="1d")
+            except:
+                pass
+
+        analysis = await analyst.analyze_market(market, news, price_history)
+
+        # Also score with LLM data
+        scorer = OpportunityScorer()
+        score = scorer.score_opportunity(
+            market, news,
+            llm_probability=analysis["probability"],
+            llm_confidence=analysis["confidence"],
+            llm_reasoning=analysis.get("reasoning"),
+        )
+
+        sizer = KellySizer()
+        sizing = sizer.calculate(
+            estimated_prob=score.estimated_probability,
+            market_price=score.current_price,
+            bankroll=1000,
+            direction=score.direction,
+        )
+
+        return {
+            "market": question,
+            "condition_id": condition_id,
+            "current_price": score.current_price,
+            "llm_analysis": analysis,
+            "score": {
+                "composite_score": score.score,
+                "edge": score.edge,
+                "direction": score.direction,
+                "estimated_probability": score.estimated_probability,
+            },
+            "sizing": {
+                "kelly_full": sizing.kelly_full,
+                "kelly_fraction": sizing.kelly_fraction,
+                "bet_size_usd": sizing.bet_size_usd,
+                "expected_value": sizing.expected_value,
+            },
+            "news_count": len(news),
+            "news": news[:5],
+        }
     finally:
         await poly_client.close()
         await pipeline.close()
