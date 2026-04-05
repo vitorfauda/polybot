@@ -21,6 +21,14 @@ class Settings(BaseSettings):
     # Claude
     anthropic_api_key: str = ""
 
+    # Supabase
+    supabase_url: str = ""
+    supabase_key: str = ""
+
+    # Telegram
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+
     # News
     newsapi_key: str = ""
     fred_api_key: str = ""

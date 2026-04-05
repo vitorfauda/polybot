@@ -8,34 +8,54 @@ from services.news.pipeline import NewsPipeline
 from services.analysis.scorer import OpportunityScorer
 from services.analysis.llm_analyst import LLMAnalyst
 from services.risk.kelly import KellySizer
+from services.storage import StorageService
+from services.telegram_bot import TelegramAlert
 
 router = APIRouter()
 
-# Global executor instance (in-memory for now, will move to DB later)
+# In-memory executor (fallback)
 executor = TradeExecutor(mode=ExecutionMode.SIMULATION)
+
+# Supabase storage (optional - degrades gracefully)
+def _get_storage() -> StorageService | None:
+    try:
+        s = StorageService()
+        s._check()
+        return s
+    except:
+        return None
 
 
 class TradeRequest(BaseModel):
     market_id: str
-    direction: str = "yes"  # "yes" or "no"
-    amount_usd: float = 0  # 0 = use Kelly sizing
+    direction: str = "yes"
+    amount_usd: float = 0
     use_llm: bool = True
 
 
 class ResolveRequest(BaseModel):
-    trade_id: str
+    trade_id: int
     outcome: str  # "yes" or "no"
 
 
 @router.get("/portfolio")
 async def get_portfolio():
     """Get current portfolio state."""
+    storage = _get_storage()
+    if storage:
+        return storage.get_stats()
     return executor.get_portfolio()
 
 
 @router.get("/positions")
 async def get_positions():
     """Get all positions (open and closed)."""
+    storage = _get_storage()
+    if storage:
+        open_trades = storage.get_open_trades()
+        closed = storage.get_trades(limit=50)
+        closed = [t for t in closed if t.get("status") in ("won", "lost")]
+        return {"positions": open_trades + closed, "count": len(open_trades) + len(closed)}
     positions = executor.get_positions()
     return {"positions": positions, "count": len(positions)}
 
@@ -43,6 +63,10 @@ async def get_positions():
 @router.get("/history")
 async def get_trade_history():
     """Get trade history."""
+    storage = _get_storage()
+    if storage:
+        trades = storage.get_trades(limit=100)
+        return {"trades": trades, "count": len(trades)}
     trades = executor.get_trades()
     return {"trades": trades, "count": len(trades)}
 
@@ -54,9 +78,10 @@ async def execute_trade(req: TradeRequest):
     pipeline = NewsPipeline()
     scorer = OpportunityScorer()
     sizer = KellySizer()
+    storage = _get_storage()
+    telegram = TelegramAlert()
 
     try:
-        # Get market data
         markets = await poly_client.get_active_markets(limit=100)
         market = None
         for m in markets:
@@ -67,11 +92,9 @@ async def execute_trade(req: TradeRequest):
         if not market:
             raise HTTPException(status_code=404, detail=f"Market {req.market_id} not found")
 
-        # Get news
         question = market.get("question", "")
         news = await pipeline.collect_for_market(question, max_results=5)
 
-        # Get analysis
         llm_analysis = None
         if req.use_llm:
             try:
@@ -80,7 +103,6 @@ async def execute_trade(req: TradeRequest):
             except Exception as e:
                 print(f"[Trade] LLM analysis failed: {e}")
 
-        # Score opportunity
         score = scorer.score_opportunity(
             market, news,
             llm_probability=llm_analysis["probability"] if llm_analysis else None,
@@ -88,9 +110,13 @@ async def execute_trade(req: TradeRequest):
             llm_reasoning=llm_analysis.get("reasoning") if llm_analysis else None,
         )
 
-        # Calculate sizing
-        portfolio = executor.get_portfolio()
-        bankroll = portfolio["balance"]
+        # Get bankroll
+        if storage:
+            portfolio = storage.get_portfolio()
+            bankroll = portfolio.get("available", portfolio.get("total_balance", 1000))
+        else:
+            portfolio = executor.get_portfolio()
+            bankroll = portfolio["balance"]
 
         if req.amount_usd > 0:
             size_usd = min(req.amount_usd, bankroll)
@@ -104,36 +130,33 @@ async def execute_trade(req: TradeRequest):
             size_usd = sizing.bet_size_usd
 
         if size_usd < 0.01:
-            return {
-                "status": "rejected",
-                "reason": "Calculated bet size too small (no edge or insufficient bankroll)",
-                "score": score.score,
-                "edge": score.edge,
-                "analysis": llm_analysis,
-            }
+            return {"status": "rejected", "reason": "No edge or insufficient bankroll"}
 
-        # Execute trade
-        result = await executor.execute_trade(
-            market=market,
-            direction=req.direction,
-            size_usd=size_usd,
-            price=score.current_price if req.direction == "yes" else (1 - score.current_price),
-            edge=score.edge,
-            kelly_fraction=score.confidence,
-        )
-
-        return {
-            "trade": result.to_dict(),
-            "analysis": llm_analysis,
-            "score": {
-                "score": score.score,
-                "edge": score.edge,
-                "confidence": score.confidence,
-                "direction": score.direction,
-                "estimated_probability": score.estimated_probability,
-            },
-            "portfolio": executor.get_portfolio(),
+        price = score.current_price if req.direction == "yes" else (1 - score.current_price)
+        trade_data = {
+            "market_id": score.market_id,
+            "question": question,
+            "side": "buy",
+            "direction": req.direction,
+            "price": price,
+            "size": size_usd / price if price > 0 else 0,
+            "cost": size_usd,
+            "status": "simulated",
+            "edge": score.edge,
         }
+
+        # Persist
+        if storage:
+            saved = storage.save_trade(trade_data)
+            storage.update_portfolio({
+                "invested": portfolio["invested"] + size_usd,
+                "available": portfolio["available"] - size_usd,
+            })
+            await telegram.notify_trade(trade_data, llm_analysis)
+            return {"trade": saved, "analysis": llm_analysis, "portfolio": storage.get_stats()}
+        else:
+            result = await executor.execute_trade(market, req.direction, size_usd, price, edge=score.edge)
+            return {"trade": result.to_dict(), "analysis": llm_analysis, "portfolio": executor.get_portfolio()}
 
     finally:
         await poly_client.close()
@@ -142,14 +165,49 @@ async def execute_trade(req: TradeRequest):
 
 @router.post("/resolve")
 async def resolve_position(req: ResolveRequest):
-    """Manually resolve a simulated position."""
-    result = executor.resolve_position(req.trade_id, req.outcome)
-    if result is None:
-        raise HTTPException(status_code=404, detail=f"Position {req.trade_id} not found or already closed")
-    return {
-        "resolved": result,
-        "portfolio": executor.get_portfolio(),
-    }
+    """Resolve a simulated position."""
+    storage = _get_storage()
+    telegram = TelegramAlert()
+
+    if storage:
+        # Get trade
+        trades = storage.get_trades(limit=200)
+        trade = None
+        for t in trades:
+            if t["id"] == req.trade_id:
+                trade = t
+                break
+        if not trade:
+            raise HTTPException(status_code=404, detail=f"Trade {req.trade_id} not found")
+
+        won = trade["direction"] == req.outcome
+        if won:
+            payout = trade["size"] * 1.0
+            pnl = payout - trade["cost"]
+        else:
+            payout = 0
+            pnl = -trade["cost"]
+
+        storage.resolve_trade(req.trade_id, req.outcome, round(pnl, 2))
+
+        # Update portfolio
+        portfolio = storage.get_portfolio()
+        storage.update_portfolio({
+            "invested": max(0, portfolio["invested"] - trade["cost"]),
+            "available": portfolio["available"] + payout,
+            "total_pnl": portfolio["total_pnl"] + pnl,
+            "total_balance": portfolio["total_balance"] + pnl,
+            "win_count": portfolio["win_count"] + (1 if won else 0),
+            "loss_count": portfolio["loss_count"] + (0 if won else 1),
+        })
+
+        await telegram.notify_resolution({"question": trade.get("market_id"), "pnl": pnl, "outcome": req.outcome})
+        return {"resolved": True, "pnl": round(pnl, 2), "portfolio": storage.get_stats()}
+    else:
+        result = executor.resolve_position(str(req.trade_id), req.outcome)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Position not found")
+        return {"resolved": result, "portfolio": executor.get_portfolio()}
 
 
 @router.post("/auto-scan")
@@ -160,105 +218,15 @@ async def auto_scan_and_trade(
     max_trades: int = Query(3),
     use_llm: bool = Query(True),
 ):
-    """Automatically scan markets, analyze with LLM, and execute best opportunities."""
-    poly_client = PolymarketClient()
-    pipeline = NewsPipeline()
-    scorer = OpportunityScorer()
-    sizer = KellySizer()
-
-    try:
-        # Fetch markets
-        markets = await poly_client.get_active_markets(limit=50)
-
-        # Score all markets with news
-        scored = []
-        for market in markets:
-            question = market.get("question", "")
-            if not question:
-                continue
-            news = await pipeline.collect_for_market(question, max_results=3)
-            score = scorer.score_opportunity(market, news)
-            if abs(score.edge) >= min_edge:
-                scored.append((market, news, score))
-
-        # Sort by score
-        scored.sort(key=lambda x: x[2].score, reverse=True)
-
-        # Analyze top opportunities with LLM and potentially trade
-        results = []
-        trades_executed = 0
-
-        for market, news, initial_score in scored[:max_trades * 2]:
-            if trades_executed >= max_trades:
-                break
-
-            llm_analysis = None
-            if use_llm:
-                try:
-                    analyst = LLMAnalyst()
-                    llm_analysis = await analyst.analyze_market(market, news)
-                except:
-                    pass
-
-            # Re-score with LLM data
-            if llm_analysis:
-                score = scorer.score_opportunity(
-                    market, news,
-                    llm_probability=llm_analysis["probability"],
-                    llm_confidence=llm_analysis["confidence"],
-                    llm_reasoning=llm_analysis.get("reasoning"),
-                )
-            else:
-                score = initial_score
-
-            if score.score < min_score or abs(score.edge) < min_edge:
-                results.append({
-                    "market": market.get("question", ""),
-                    "action": "skip",
-                    "reason": f"Score {score.score:.2f} or edge {score.edge:.3f} below threshold",
-                })
-                continue
-
-            # Calculate sizing
-            portfolio = executor.get_portfolio()
-            sizing = sizer.calculate(
-                estimated_prob=score.estimated_probability,
-                market_price=score.current_price,
-                bankroll=portfolio["balance"],
-                direction=score.direction,
-            )
-
-            if sizing.bet_size_usd < 1.0:
-                continue
-
-            # Execute
-            trade_result = await executor.execute_trade(
-                market=market,
-                direction=score.direction,
-                size_usd=sizing.bet_size_usd,
-                price=score.current_price if score.direction == "yes" else (1 - score.current_price),
-                edge=score.edge,
-                kelly_fraction=sizing.kelly_fraction,
-            )
-
-            trades_executed += 1
-            results.append({
-                "market": market.get("question", ""),
-                "action": "traded",
-                "trade": trade_result.to_dict(),
-                "analysis": llm_analysis,
-                "score": score.score,
-                "edge": score.edge,
-            })
-
-        return {
-            "scanned": len(markets),
-            "opportunities_found": len(scored),
-            "trades_executed": trades_executed,
-            "results": results,
-            "portfolio": executor.get_portfolio(),
-        }
-
-    finally:
-        await poly_client.close()
-        await pipeline.close()
+    """Auto scan, analyze, and execute trades."""
+    from workers.auto_scanner import run_scan
+    result = await run_scan(
+        min_edge=min_edge,
+        min_score=min_score,
+        max_trades=max_trades,
+        use_llm=use_llm,
+        bankroll=bankroll,
+    )
+    storage = _get_storage()
+    portfolio = storage.get_stats() if storage else executor.get_portfolio()
+    return {**result, "portfolio": portfolio}
