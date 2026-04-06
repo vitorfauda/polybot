@@ -44,7 +44,16 @@ class OpportunityScorer:
         llm_reasoning: Optional[str] = None,
     ) -> MarketScore:
         """Score a single market opportunity."""
-        current_price = float(market.get("outcomePrices", "[0.5,0.5]").strip("[]").split(",")[0])
+        prices_raw = market.get("outcomePrices", "[0.5,0.5]")
+        if isinstance(prices_raw, str):
+            import json
+            try:
+                prices_list = json.loads(prices_raw)
+            except:
+                prices_list = [0.5, 0.5]
+        else:
+            prices_list = prices_raw
+        current_price = float(prices_list[0]) if prices_list else 0.5
         volume = float(market.get("volume", 0))
         liquidity = float(market.get("liquidity", 0))
 

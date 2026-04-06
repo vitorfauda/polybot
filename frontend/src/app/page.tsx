@@ -209,14 +209,17 @@ export default function Dashboard() {
     try {
       setAutoTrading(true);
       setAutoTradeResult(null);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 300000); // 5 min timeout
       const res = await fetch(
-        `${API_BASE}/api/trades/auto-scan?bankroll=1000&min_edge=0.05&min_score=0.3&max_trades=3&use_llm=true`,
-        { method: "POST" }
+        `${API_BASE}/api/trades/auto-scan?bankroll=1000&min_edge=0.05&min_score=0.3&max_trades=3&use_llm=false`,
+        { method: "POST", signal: controller.signal }
       );
+      clearTimeout(timeout);
       if (!res.ok) throw new Error(`API ${res.status}`);
       const data = await res.json();
       setAutoTradeResult(
-        `Scanned ${data.scanned} markets, found ${data.opportunities_found} opportunities, executed ${data.trades_executed} trades`
+        `Scanned ${data.scanned} markets, found ${data.opportunities || data.opportunities_found || 0} opportunities, executed ${data.trades || data.trades_executed || 0} trades`
       );
       // Refresh data
       await Promise.all([fetchDashboard(), fetchTrades()]);
@@ -323,7 +326,7 @@ uvicorn api.main:app --reload`}
                 <Wallet className="w-3.5 h-3.5" />
                 Balance
               </div>
-              <p className="text-2xl font-bold">{formatUSD(portfolio.balance || 0)}</p>
+              <p className="text-2xl font-bold">{formatUSD(portfolio.total_balance || portfolio.balance || 0)}</p>
               <p className="text-xs text-muted-foreground">Invested: {formatUSD(portfolio.invested || 0)}</p>
             </CardContent>
           </Card>

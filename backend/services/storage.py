@@ -121,7 +121,7 @@ class StorageService:
                 "sentiment_label": a.get("sentiment_label", "neutral"),
             })
         if rows:
-            self.client.table("news").upsert(rows, on_conflict="title").execute()
+            self.client.table("news").insert(rows).execute()
         return len(rows)
 
     def get_recent_news(self, limit: int = 30) -> list[dict]:
