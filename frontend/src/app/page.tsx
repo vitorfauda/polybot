@@ -212,7 +212,7 @@ export default function Dashboard() {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 300000); // 5 min timeout
       const res = await fetch(
-        `${API_BASE}/api/trades/auto-scan?bankroll=1000&min_edge=0.05&min_score=0.3&max_trades=3&use_llm=false`,
+        `${API_BASE}/api/trades/auto-scan?bankroll=1000&min_edge=0.05&min_score=0.3&max_trades=3&use_llm=true`,
         { method: "POST", signal: controller.signal }
       );
       clearTimeout(timeout);
@@ -628,34 +628,87 @@ uvicorn api.main:app --reload`}
                 </CardContent>
               </Card>
             ) : (
-              trades.slice().reverse().map((trade) => (
-                <Card key={trade.trade_id} className="hover:bg-muted/30 transition">
-                  <CardContent className="py-3">
-                    <div className="flex items-start justify-between gap-4">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-1">
-                          <Badge variant="secondary" className="text-xs font-mono">{trade.trade_id}</Badge>
-                          <Badge className={trade.status === "filled" ? "bg-emerald-500/20 text-emerald-400" : "bg-red-500/20 text-red-400"}>
-                            {trade.status}
-                          </Badge>
+              trades.map((trade: Record<string, unknown>) => {
+                const id = (trade.id || trade.trade_id || Math.random()) as string | number;
+                const direction = ((trade.direction as string) || "yes").toUpperCase();
+                const status = (trade.status as string) || "simulated";
+                const price = Number(trade.price) || 0;
+                const cost = Number(trade.cost) || 0;
+                const edge = Number(trade.edge) || 0;
+                const pnl = trade.pnl as number | null;
+                const ts = (trade.created_at || trade.timestamp) as string;
+                const question = (trade.question as string) || "";
+                const reasoning = (trade.reasoning as string) || "";
+                const endDate = trade.end_date as string;
+                const isWon = status === "won";
+                const isLost = status === "lost";
+                const prob = price > 0 ? (price * 100).toFixed(0) : "?";
+
+                // Days until expiry
+                let expiryText = "";
+                if (endDate) {
+                  const days = Math.ceil((new Date(endDate).getTime() - Date.now()) / 86400000);
+                  expiryText = days > 0 ? `${days}d left` : "Expired";
+                }
+
+                return (
+                  <Card key={String(id)} className="hover:bg-muted/30 transition">
+                    <CardContent className="py-4">
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="flex-1 min-w-0">
+                          {/* Header badges */}
+                          <div className="flex items-center gap-2 mb-2">
+                            <Badge variant="secondary" className="text-xs font-mono">#{String(id)}</Badge>
+                            <Badge className={
+                              isWon ? "bg-emerald-500/20 text-emerald-400" :
+                              isLost ? "bg-red-500/20 text-red-400" :
+                              "bg-yellow-500/20 text-yellow-400"
+                            }>
+                              {status}
+                            </Badge>
+                            <Badge className={direction === "YES" ? "bg-emerald-500/20 text-emerald-400" : "bg-red-500/20 text-red-400"}>
+                              {direction} @ {prob}%
+                            </Badge>
+                            {edge > 0 && (
+                              <Badge className="bg-blue-500/20 text-blue-400 border-blue-500/30">
+                                Edge: +{(edge * 100).toFixed(1)}%
+                              </Badge>
+                            )}
+                            {expiryText && (
+                              <Badge variant="secondary" className="text-xs">
+                                {expiryText}
+                              </Badge>
+                            )}
+                          </div>
+                          {/* Question */}
+                          <h4 className="font-medium text-sm leading-tight mb-1">
+                            {question || "Market ID: " + ((trade.market_id as string) || "").slice(0, 20) + "..."}
+                          </h4>
+                          {/* Reasoning */}
+                          {reasoning && (
+                            <p className="text-xs text-muted-foreground bg-muted/50 p-2 rounded mt-1 leading-relaxed">
+                              <span className="text-yellow-500 font-medium">Why: </span>
+                              {reasoning}
+                            </p>
+                          )}
+                          {/* Meta */}
+                          <div className="flex items-center gap-3 text-xs text-muted-foreground mt-2">
+                            {ts && <span>{new Date(ts).toLocaleString()}</span>}
+                          </div>
                         </div>
-                        <h4 className="font-medium text-sm leading-tight mb-1">{trade.question}</h4>
-                        <div className="flex items-center gap-3 text-xs text-muted-foreground">
-                          <span>{trade.direction.toUpperCase()}</span>
-                          <span>{trade.size.toFixed(1)} shares</span>
-                          <span>@ {formatUSD(trade.price)}</span>
-                          <span>Edge: {(trade.edge * 100).toFixed(1)}%</span>
-                          <span>{new Date(trade.timestamp).toLocaleString()}</span>
+                        <div className="text-right shrink-0">
+                          <div className="text-lg font-bold">{formatUSD(cost)}</div>
+                          {pnl !== null && pnl !== undefined && (
+                            <div className={`text-sm font-bold ${pnl >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                              {pnl >= 0 ? "+" : ""}{formatUSD(pnl)}
+                            </div>
+                          )}
                         </div>
                       </div>
-                      <div className="text-right shrink-0">
-                        <div className="font-bold">{formatUSD(trade.cost)}</div>
-                        <div className="text-xs text-muted-foreground">{trade.mode}</div>
-                      </div>
-                    </div>
-                  </CardContent>
-                </Card>
-              ))
+                    </CardContent>
+                  </Card>
+                );
+              })
             )}
           </TabsContent>
 

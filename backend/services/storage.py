@@ -55,8 +55,19 @@ class StorageService:
         }
         if trade.get("analysis_id"):
             row["analysis_id"] = trade["analysis_id"]
-        res = self.client.table("trades").insert(row).execute()
-        return res.data[0] if res.data else row
+
+        # Try with extended columns, fallback to basic if schema not cached yet
+        extended = {
+            "question": trade.get("question", ""),
+            "end_date": trade.get("end_date"),
+            "edge": trade.get("edge", 0),
+            "reasoning": trade.get("reasoning", ""),
+        }
+        try:
+            res = self.client.table("trades").insert({**row, **extended}).execute()
+        except Exception:
+            res = self.client.table("trades").insert(row).execute()
+        return res.data[0] if res.data else {**row, **extended}
 
     def get_trades(self, limit: int = 50) -> list[dict]:
         self._check()

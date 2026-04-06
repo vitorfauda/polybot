@@ -133,6 +133,16 @@ async def run_scan(
                 })
                 analysis_id = saved.get("id")
 
+            # Build reasoning
+            reasoning = ""
+            if llm_analysis:
+                reasoning = llm_analysis.get("reasoning", "")
+                factors = llm_analysis.get("key_factors", [])
+                if factors:
+                    reasoning += " | Key factors: " + ", ".join(factors[:3])
+            else:
+                reasoning = f"Sentiment-based: news sentiment {score.news_sentiment:+.2f} across {score.news_count} articles suggests edge of {score.edge*100:.1f}%"
+
             # Save trade
             trade_data = {
                 "market_id": score.market_id,
@@ -144,6 +154,8 @@ async def run_scan(
                 "cost": sizing.bet_size_usd,
                 "status": "simulated",
                 "edge": score.edge,
+                "end_date": market.get("endDate"),
+                "reasoning": reasoning,
                 "analysis_id": analysis_id,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
