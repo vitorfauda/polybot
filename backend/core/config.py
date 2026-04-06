@@ -1,5 +1,12 @@
+import os
+from pathlib import Path
+from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+
+# Force load .env before pydantic reads settings
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(_env_path, override=True)
 
 
 class Settings(BaseSettings):
@@ -39,7 +46,7 @@ class Settings(BaseSettings):
     min_edge: float = 0.05  # minimum 5% edge to trade
     max_open_positions: int = 10
 
-    model_config = {"env_file": ".env", "extra": "ignore"}
+    model_config = {"extra": "ignore"}
 
 
 @lru_cache
