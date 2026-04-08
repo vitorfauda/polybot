@@ -310,6 +310,27 @@ async def resolve_all_trades():
     return await resolve_open_trades()
 
 
+@router.post("/hft-scan")
+async def hft_scan(
+    bet_size: float = Query(5),
+    min_volume: float = Query(1000),
+    min_confidence: float = Query(0.85),
+    min_net_edge: float = Query(0.02),
+    max_trades: int = Query(2),
+    dry_run: bool = Query(False),
+):
+    """Run HFT crypto scanner with microstructure analysis."""
+    from workers.hft_crypto_scanner import hft_scan_cycle
+    return await hft_scan_cycle(
+        bet_size=bet_size,
+        min_volume=min_volume,
+        min_confidence=min_confidence,
+        min_net_edge=min_net_edge,
+        max_trades=max_trades,
+        dry_run=dry_run,
+    )
+
+
 @router.post("/scan-crypto")
 async def scan_crypto_markets(
     max_markets: int = Query(20),
