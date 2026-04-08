@@ -355,34 +355,51 @@ async def run_profile_scan(profile: TradingProfile) -> dict:
         results = []
         trades_executed = 0
 
+        # Aggressive profiles (Scout) skip the strategy orchestrator
+        # for speed and to actually execute trades
+        is_aggressive = profile.name == "scout"
+
         for market, news, initial_score in candidates[:profile.max_trades_per_scan * 4]:
             if trades_executed >= profile.max_trades_per_scan:
                 break
 
             question = market.get("question", "")
 
-            # === STEP A: Run multi-strategy orchestrator ===
-            orchestrator = StrategyOrchestrator()
-            try:
-                consensus = await orchestrator.evaluate(
-                    market, news,
-                    min_agreeing=profile.min_strategies_agreeing,
-                )
-            except Exception as e:
-                print(f"[{profile.display_name}] Strategy error: {e}")
+            # === STEP A: Run multi-strategy orchestrator (skip for Scout) ===
+            if is_aggressive:
+                # Scout fast path: trust initial score if it has any edge
+                if abs(initial_score.edge) < profile.min_edge:
+                    continue
+                consensus = {
+                    "should_trade": True,
+                    "direction": initial_score.direction,
+                    "agreeing_strategies": 1,
+                    "consensus_reasoning": f"Scout fast-path: edge {initial_score.edge*100:.1f}%, sentiment {initial_score.news_sentiment:+.2f}",
+                }
+            else:
+                orchestrator = StrategyOrchestrator()
+                try:
+                    consensus = await orchestrator.evaluate(
+                        market, news,
+                        min_agreeing=profile.min_strategies_agreeing,
+                    )
+                except Exception as e:
+                    print(f"[{profile.display_name}] Strategy error: {e}")
+                    await orchestrator.close()
+                    continue
                 await orchestrator.close()
-                continue
-            await orchestrator.close()
 
-            if not consensus["should_trade"]:
-                print(f"[{profile.display_name}] SKIP '{question[:40]}' - {consensus['consensus_reasoning'][:80]}")
-                continue
+                if not consensus["should_trade"]:
+                    print(f"[{profile.display_name}] SKIP '{question[:40]}' - {consensus['consensus_reasoning'][:80]}")
+                    continue
 
-            print(f"[{profile.display_name}] CONSENSUS '{question[:40]}' - {consensus['agreeing_strategies']} strategies agree on {consensus['direction'].upper()}")
+                print(f"[{profile.display_name}] CONSENSUS '{question[:40]}' - {consensus['agreeing_strategies']} strategies agree on {consensus['direction'].upper()}")
 
-            # === STEP B: Deep multi-pass Claude validation ===
+            # === STEP B: Deep multi-pass Claude validation (skip for Scout) ===
             llm_analysis = None
-            if settings.anthropic_api_key:
+            verdict = "BUY"  # default for aggressive profiles
+
+            if not is_aggressive and settings.anthropic_api_key:
                 try:
                     analyst = DeepAnalyst()
                     llm_analysis = await analyst.full_analysis(market, news)
@@ -391,42 +408,44 @@ async def run_profile_scan(profile: TradingProfile) -> dict:
                     print(f"[{profile.display_name}] LLM error: {e}")
                     continue
 
-            if not llm_analysis:
-                continue
-
-            # Claude must agree with strategy consensus
-            if llm_analysis.get("direction") != consensus["direction"]:
-                print(f"[{profile.display_name}] SKIP '{question[:40]}' - Claude says {llm_analysis.get('direction')} but strategies say {consensus['direction']}")
-                continue
-
-            # Profile-specific verdict check
-            verdict = llm_analysis.get("final_verdict", "SKIP")
-            if verdict not in profile.required_verdict:
-                print(f"[{profile.display_name}] SKIP '{question[:40]}' - verdict {verdict} not in {profile.required_verdict}")
-                continue
-
-            # Pass consensus check
-            if profile.require_pass_consensus:
-                p1 = llm_analysis.get("pass1_prob", 0.5)
-                p2 = llm_analysis.get("pass2_prob", 0.5)
-                p3 = llm_analysis.get("pass3_prob", 0.5)
-                # All passes must agree on direction (>0.5 or <0.5)
-                if not ((p1 > 0.5 and p2 > 0.5 and p3 > 0.5) or (p1 < 0.5 and p2 < 0.5 and p3 < 0.5)):
-                    print(f"[{profile.display_name}] SKIP '{question[:40]}' - pass consensus failed ({p1:.2f}/{p2:.2f}/{p3:.2f})")
+                if not llm_analysis:
                     continue
 
-            # Confidence check
-            if llm_analysis["confidence"] < profile.min_claude_confidence:
-                print(f"[{profile.display_name}] SKIP '{question[:40]}' - confidence {llm_analysis['confidence']:.0%} < {profile.min_claude_confidence:.0%}")
-                continue
+                # Claude must agree with strategy consensus
+                if llm_analysis.get("direction") != consensus["direction"]:
+                    print(f"[{profile.display_name}] SKIP '{question[:40]}' - Claude says {llm_analysis.get('direction')} but strategies say {consensus['direction']}")
+                    continue
 
-            # Re-score with LLM
-            score = scorer.score_opportunity(
-                market, news,
-                llm_probability=llm_analysis["probability"],
-                llm_confidence=llm_analysis["confidence"],
-                llm_reasoning=llm_analysis.get("reasoning"),
-            )
+                # Profile-specific verdict check
+                verdict = llm_analysis.get("final_verdict", "SKIP")
+                if verdict not in profile.required_verdict:
+                    print(f"[{profile.display_name}] SKIP '{question[:40]}' - verdict {verdict} not in {profile.required_verdict}")
+                    continue
+
+                # Pass consensus check
+                if profile.require_pass_consensus:
+                    p1 = llm_analysis.get("pass1_prob", 0.5)
+                    p2 = llm_analysis.get("pass2_prob", 0.5)
+                    p3 = llm_analysis.get("pass3_prob", 0.5)
+                    if not ((p1 > 0.5 and p2 > 0.5 and p3 > 0.5) or (p1 < 0.5 and p2 < 0.5 and p3 < 0.5)):
+                        print(f"[{profile.display_name}] SKIP '{question[:40]}' - pass consensus failed")
+                        continue
+
+                # Confidence check
+                if llm_analysis["confidence"] < profile.min_claude_confidence:
+                    print(f"[{profile.display_name}] SKIP '{question[:40]}' - confidence {llm_analysis['confidence']:.0%} < {profile.min_claude_confidence:.0%}")
+                    continue
+
+            # Re-score (with or without LLM)
+            if llm_analysis:
+                score = scorer.score_opportunity(
+                    market, news,
+                    llm_probability=llm_analysis["probability"],
+                    llm_confidence=llm_analysis["confidence"],
+                    llm_reasoning=llm_analysis.get("reasoning"),
+                )
+            else:
+                score = initial_score
 
             # Final edge and score check
             if abs(score.edge) < profile.min_edge:
@@ -450,15 +469,23 @@ async def run_profile_scan(profile: TradingProfile) -> dict:
                 continue
 
             # Build reasoning combining Claude + Strategies
-            reasoning = llm_analysis.get("reasoning", "")
-            factors = llm_analysis.get("key_factors", [])
-            if factors:
-                reasoning += " | Factors: " + ", ".join(factors[:3])
-            reasoning += f" | Strategies({consensus['agreeing_strategies']}): {consensus['consensus_reasoning'][:200]}"
-            devil = llm_analysis.get("devils_advocate", "")
-            if devil:
-                reasoning += f" | Risk: {devil[:100]}"
-            reasoning += f" | Verdict: {verdict}"
+            if llm_analysis:
+                reasoning = llm_analysis.get("reasoning", "")
+                factors = llm_analysis.get("key_factors", [])
+                if factors:
+                    reasoning += " | Factors: " + ", ".join(factors[:3])
+                reasoning += f" | Strategies({consensus['agreeing_strategies']}): {consensus['consensus_reasoning'][:200]}"
+                devil = llm_analysis.get("devils_advocate", "")
+                if devil:
+                    reasoning += f" | Risk: {devil[:100]}"
+                reasoning += f" | Verdict: {verdict}"
+            else:
+                # Scout fast path - no LLM
+                reasoning = (
+                    f"[SCOUT FAST] Edge {score.edge*100:+.1f}%, "
+                    f"sentiment {score.news_sentiment:+.2f} across {score.news_count} articles, "
+                    f"price {score.current_price*100:.0f}% → estimate {score.estimated_probability*100:.0f}%"
+                )
 
             # Save analysis
             analysis_id = None
@@ -507,13 +534,14 @@ async def run_profile_scan(profile: TradingProfile) -> dict:
             await telegram.notify_trade(trade_data, llm_analysis)
 
             trades_executed += 1
-            print(f"[{profile.display_name}] TRADE #{trades_executed}: {score.direction.upper()} '{question[:50]}' | Conf: {llm_analysis['confidence']:.0%} | Edge: {score.edge*100:.1f}% | ${size_usd:.2f}")
+            conf = llm_analysis["confidence"] if llm_analysis else score.confidence
+            print(f"[{profile.display_name}] TRADE #{trades_executed}: {score.direction.upper()} '{question[:50]}' | Conf: {conf:.0%} | Edge: {score.edge*100:.1f}% | ${size_usd:.2f}")
 
             results.append({
                 "question": question,
                 "direction": score.direction,
                 "edge": score.edge,
-                "confidence": llm_analysis["confidence"],
+                "confidence": conf,
                 "cost": size_usd,
                 "verdict": verdict,
             })

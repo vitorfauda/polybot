@@ -1,7 +1,11 @@
-"""Trading Profiles - 3 different strategies all targeting 90%+ accuracy.
+"""Trading Profiles - 3 risk levels for performance comparison.
 
-The goal is NOT to compare risk levels - it's to compare DIFFERENT METHODOLOGIES
-for finding ultra-high-confidence trades.
+After conversation: User wants to test 3 distinct profiles operating in parallel
+to find the sweet spot between trade frequency and accuracy.
+
+- HUNTER: Ultra-strict (current 90%+ target). Few trades, max precision.
+- SNIPER: Medium strictness. Some trades per cycle.
+- SCOUT: Aggressive. MANY trades. Validates that the scoring works at scale.
 """
 
 from dataclasses import dataclass
@@ -14,40 +18,42 @@ class TradingProfile:
     description: str
     # Edge thresholds
     min_edge: float
-    # Score thresholds (composite score)
     min_score: float
     # Claude AI requirements
     min_claude_confidence: float
-    required_verdict: list[str]  # acceptable Claude verdicts
-    require_pass_consensus: bool  # all 3 passes must agree on direction
+    required_verdict: list[str]
+    require_pass_consensus: bool
     # Market filters
-    min_volume: float  # minimum market volume in USD
-    min_liquidity: float  # minimum order book liquidity
+    min_volume: float
+    min_liquidity: float
     max_hours_to_expiry: float
     min_hours_to_expiry: float
     # News requirements
-    min_news_count: int  # minimum news articles found
-    require_sentiment_alignment: bool  # news sentiment must agree with direction
+    min_news_count: int
+    require_sentiment_alignment: bool
     # Sizing
     bet_size_usd: float
     max_trades_per_scan: int
-    # Avoid markets where price is at extremes (likely already correct)
+    # Extreme price filter
     avoid_extreme_prices: bool
     extreme_price_threshold: float
     # Strategy consensus required
-    min_strategies_agreeing: int = 2  # min independent strategies that must agree
+    min_strategies_agreeing: int = 2
 
 
-# === HUNTER === Ultra-strict, trades very rarely, only the surest bets
+# ════════════════════════════════════════════════════════════════
+# HUNTER === Ultra-conservador (mantém perfil atual)
+# Target: 90%+ win rate. Trades raros mas certeiros.
+# ════════════════════════════════════════════════════════════════
 HUNTER = TradingProfile(
     name="hunter",
-    display_name="Hunter",
-    description="Caçador: Ultra-strict filters. Only trades when ALL signals align perfectly. Few trades, max accuracy.",
-    min_edge=0.12,  # need 12%+ edge
-    min_score=0.45,
-    min_claude_confidence=0.75,  # Claude must be 75%+ confident
-    required_verdict=["STRONG_BUY"],  # only the strongest signal
-    require_pass_consensus=True,  # all 3 Claude passes must agree
+    display_name="Hunter (Conservador)",
+    description="Caçador: Ultra-strict. Só executa quando TODOS os sinais alinham. Poucos trades, máxima assertividade.",
+    min_edge=0.10,
+    min_score=0.40,
+    min_claude_confidence=0.75,
+    required_verdict=["STRONG_BUY"],
+    require_pass_consensus=True,
     min_volume=500,
     min_liquidity=200,
     max_hours_to_expiry=36,
@@ -58,69 +64,79 @@ HUNTER = TradingProfile(
     max_trades_per_scan=1,
     avoid_extreme_prices=True,
     extreme_price_threshold=0.05,
-    min_strategies_agreeing=3,  # need 3 of 4 strategies agreeing
+    min_strategies_agreeing=3,
 )
 
-# === SNIPER === Balanced precision, trades selectively but more often than Hunter
+
+# ════════════════════════════════════════════════════════════════
+# SNIPER === Médio rigor
+# Balanço entre frequência e precisão. Aceita BUY também.
+# ════════════════════════════════════════════════════════════════
 SNIPER = TradingProfile(
     name="sniper",
-    display_name="Sniper",
-    description="Atirador: Multi-signal validation. Requires Claude AI + news + market consensus. Balanced precision.",
-    min_edge=0.08,  # 8%+ edge
-    min_score=0.35,
-    min_claude_confidence=0.65,
-    required_verdict=["STRONG_BUY", "BUY"],
-    require_pass_consensus=True,
-    min_volume=200,
-    min_liquidity=100,
-    max_hours_to_expiry=36,
+    display_name="Sniper (Médio)",
+    description="Atirador: Rigor médio. Aceita BUY e STRONG_BUY. Filtros relaxados mas Claude precisa concordar.",
+    min_edge=0.04,
+    min_score=0.20,
+    min_claude_confidence=0.55,
+    required_verdict=["STRONG_BUY", "BUY", "HOLD"],
+    require_pass_consensus=False,
+    min_volume=100,
+    min_liquidity=50,
+    max_hours_to_expiry=48,
     min_hours_to_expiry=1,
     min_news_count=1,
-    require_sentiment_alignment=True,
+    require_sentiment_alignment=False,
     bet_size_usd=10.0,
-    max_trades_per_scan=2,
-    avoid_extreme_prices=True,
-    extreme_price_threshold=0.03,
-    min_strategies_agreeing=2,  # need 2 of 4 strategies agreeing
-)
-
-# === SCOUT === Hunts for inefficiencies via volume, takes more trades but still strict
-SCOUT = TradingProfile(
-    name="scout",
-    display_name="Scout",
-    description="Batedor: Hunts price inefficiencies. Lower edge bar but requires strong AI signal + low extreme prices.",
-    min_edge=0.06,
-    min_score=0.30,
-    min_claude_confidence=0.60,
-    required_verdict=["STRONG_BUY", "BUY"],
-    require_pass_consensus=False,  # allows some pass disagreement
-    min_volume=50,
-    min_liquidity=50,
-    max_hours_to_expiry=36,
-    min_hours_to_expiry=1,
-    min_news_count=0,
-    require_sentiment_alignment=False,  # doesn't require sentiment match
-    bet_size_usd=5.0,
     max_trades_per_scan=3,
     avoid_extreme_prices=True,
     extreme_price_threshold=0.02,
-    min_strategies_agreeing=2,  # need 2 of 4 strategies (relaxed)
+    min_strategies_agreeing=1,
 )
 
 
-# === CRYPTO HUNTER === Specialized for cryptocurrency markets only
+# ════════════════════════════════════════════════════════════════
+# SCOUT === AGRESSIVO (vários trades)
+# Filtros mínimos. Quer testar volume de trades.
+# ════════════════════════════════════════════════════════════════
+SCOUT = TradingProfile(
+    name="scout",
+    display_name="Scout (Agressivo)",
+    description="Batedor: AGRESSIVO. Filtros mínimos. Aceita qualquer sinal positivo. Muitos trades para testar volume.",
+    min_edge=0.01,
+    min_score=0.10,
+    min_claude_confidence=0.40,
+    required_verdict=["STRONG_BUY", "BUY", "HOLD"],
+    require_pass_consensus=False,
+    min_volume=10,
+    min_liquidity=10,
+    max_hours_to_expiry=72,
+    min_hours_to_expiry=1,
+    min_news_count=0,
+    require_sentiment_alignment=False,
+    bet_size_usd=5.0,
+    max_trades_per_scan=10,
+    avoid_extreme_prices=True,
+    extreme_price_threshold=0.01,
+    min_strategies_agreeing=1,
+)
+
+
+# ════════════════════════════════════════════════════════════════
+# CRYPTO HUNTER === Especialista crypto
+# ════════════════════════════════════════════════════════════════
 CRYPTO_HUNTER = TradingProfile(
     name="crypto_hunter",
     display_name="Crypto Hunter",
-    description="Caçador Crypto: Especialista em mercados de cripto. Usa preços reais, RSI, volatilidade e analise tecnica.",
-    min_edge=0.08,
-    min_score=0.30,
-    min_claude_confidence=0.65,
+    description="Caçador Crypto: Especialista em cripto. Usa preços reais, RSI, microestrutura.",
+    min_edge=0.05,
+    min_score=0.20,
+    min_claude_confidence=0.60,
     required_verdict=["STRONG_BUY", "BUY"],
-    require_pass_consensus=False,  # crypto strategy is its own consensus
+    require_pass_consensus=False,
     min_volume=100,
     min_liquidity=50,
-    max_hours_to_expiry=168,  # crypto often has longer windows
+    max_hours_to_expiry=168,
     min_hours_to_expiry=1,
     min_news_count=0,
     require_sentiment_alignment=False,
@@ -128,7 +144,7 @@ CRYPTO_HUNTER = TradingProfile(
     max_trades_per_scan=2,
     avoid_extreme_prices=True,
     extreme_price_threshold=0.03,
-    min_strategies_agreeing=1,  # crypto strategy is the primary signal
+    min_strategies_agreeing=1,
 )
 
 
