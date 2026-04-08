@@ -8,9 +8,11 @@ from services.news.pipeline import NewsPipeline
 from services.analysis.scorer import OpportunityScorer
 from services.analysis.deep_analyst import DeepAnalyst
 from services.analysis.feedback import FeedbackEngine
+from services.analysis.strategies import StrategyOrchestrator
 from services.risk.kelly import KellySizer
 from services.storage import StorageService
 from services.telegram_bot import TelegramAlert
+from services.profiles import TradingProfile, get_profile, all_profiles
 from core.config import get_settings
 
 
@@ -268,6 +270,282 @@ async def run_scan(
     finally:
         await poly_client.close()
         await pipeline.close()
+
+
+async def run_profile_scan(profile: TradingProfile) -> dict:
+    """Run a scan using a specific trading profile's filters and rules."""
+    settings = get_settings()
+    poly_client = PolymarketClient()
+    pipeline = NewsPipeline()
+    scorer = OpportunityScorer()
+    telegram = TelegramAlert()
+
+    storage = None
+    try:
+        storage = StorageService()
+        storage._check()
+    except:
+        storage = None
+
+    try:
+        print(f"\n{'='*60}")
+        print(f"[{profile.display_name}] Starting scan at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
+        print(f"{'='*60}")
+
+        # 1. Fetch markets
+        all_markets = await poly_client.get_active_markets(limit=200)
+
+        # 2. Apply profile filters
+        markets = []
+        for m in all_markets:
+            hours = _hours_until(m.get("endDate"))
+            if hours is None:
+                continue
+            if not (profile.min_hours_to_expiry <= hours <= profile.max_hours_to_expiry):
+                continue
+            volume = float(m.get("volume", 0))
+            liquidity = float(m.get("liquidity", 0))
+            if volume < profile.min_volume:
+                continue
+            if liquidity < profile.min_liquidity:
+                continue
+
+            # Check extreme prices
+            if profile.avoid_extreme_prices:
+                import json as _json
+                prices = m.get("outcomePrices", "[0.5,0.5]")
+                if isinstance(prices, str):
+                    try:
+                        prices = _json.loads(prices)
+                    except:
+                        prices = [0.5, 0.5]
+                price_yes = float(prices[0]) if prices else 0.5
+                if price_yes < profile.extreme_price_threshold or price_yes > (1 - profile.extreme_price_threshold):
+                    continue
+
+            markets.append(m)
+
+        print(f"[{profile.display_name}] Markets passing filters: {len(markets)}")
+
+        if storage:
+            storage.save_markets(markets)
+
+        # 3. Get bankroll for this profile
+        portfolio = storage.get_portfolio(profile=profile.name) if storage else None
+        bankroll = portfolio.get("available", 1000) if portfolio else 1000
+
+        # 4. Pre-filter: collect news for all eligible markets, no edge requirement here
+        # Strategies will determine if there's an opportunity, not the simple scorer
+        candidates = []
+        for market in markets[:30]:  # cap to keep scan fast
+            question = market.get("question", "")
+            if not question:
+                continue
+            news = await pipeline.collect_for_market(question, max_results=4)
+            if len(news) < profile.min_news_count:
+                continue
+            score = scorer.score_opportunity(market, news)
+            candidates.append((market, news, score))
+
+        # Sort by volume (focus on more liquid markets first)
+        candidates.sort(key=lambda x: float(x[0].get("volume", 0)), reverse=True)
+        print(f"[{profile.display_name}] Candidates with news: {len(candidates)}")
+
+        # 5. Strategy orchestration + deep analysis on top candidates
+        results = []
+        trades_executed = 0
+
+        for market, news, initial_score in candidates[:profile.max_trades_per_scan * 4]:
+            if trades_executed >= profile.max_trades_per_scan:
+                break
+
+            question = market.get("question", "")
+
+            # === STEP A: Run multi-strategy orchestrator ===
+            orchestrator = StrategyOrchestrator()
+            try:
+                consensus = await orchestrator.evaluate(
+                    market, news,
+                    min_agreeing=profile.min_strategies_agreeing,
+                )
+            except Exception as e:
+                print(f"[{profile.display_name}] Strategy error: {e}")
+                await orchestrator.close()
+                continue
+            await orchestrator.close()
+
+            if not consensus["should_trade"]:
+                print(f"[{profile.display_name}] SKIP '{question[:40]}' - {consensus['consensus_reasoning'][:80]}")
+                continue
+
+            print(f"[{profile.display_name}] CONSENSUS '{question[:40]}' - {consensus['agreeing_strategies']} strategies agree on {consensus['direction'].upper()}")
+
+            # === STEP B: Deep multi-pass Claude validation ===
+            llm_analysis = None
+            if settings.anthropic_api_key:
+                try:
+                    analyst = DeepAnalyst()
+                    llm_analysis = await analyst.full_analysis(market, news)
+                    await analyst.close()
+                except Exception as e:
+                    print(f"[{profile.display_name}] LLM error: {e}")
+                    continue
+
+            if not llm_analysis:
+                continue
+
+            # Claude must agree with strategy consensus
+            if llm_analysis.get("direction") != consensus["direction"]:
+                print(f"[{profile.display_name}] SKIP '{question[:40]}' - Claude says {llm_analysis.get('direction')} but strategies say {consensus['direction']}")
+                continue
+
+            # Profile-specific verdict check
+            verdict = llm_analysis.get("final_verdict", "SKIP")
+            if verdict not in profile.required_verdict:
+                print(f"[{profile.display_name}] SKIP '{question[:40]}' - verdict {verdict} not in {profile.required_verdict}")
+                continue
+
+            # Pass consensus check
+            if profile.require_pass_consensus:
+                p1 = llm_analysis.get("pass1_prob", 0.5)
+                p2 = llm_analysis.get("pass2_prob", 0.5)
+                p3 = llm_analysis.get("pass3_prob", 0.5)
+                # All passes must agree on direction (>0.5 or <0.5)
+                if not ((p1 > 0.5 and p2 > 0.5 and p3 > 0.5) or (p1 < 0.5 and p2 < 0.5 and p3 < 0.5)):
+                    print(f"[{profile.display_name}] SKIP '{question[:40]}' - pass consensus failed ({p1:.2f}/{p2:.2f}/{p3:.2f})")
+                    continue
+
+            # Confidence check
+            if llm_analysis["confidence"] < profile.min_claude_confidence:
+                print(f"[{profile.display_name}] SKIP '{question[:40]}' - confidence {llm_analysis['confidence']:.0%} < {profile.min_claude_confidence:.0%}")
+                continue
+
+            # Re-score with LLM
+            score = scorer.score_opportunity(
+                market, news,
+                llm_probability=llm_analysis["probability"],
+                llm_confidence=llm_analysis["confidence"],
+                llm_reasoning=llm_analysis.get("reasoning"),
+            )
+
+            # Final edge and score check
+            if abs(score.edge) < profile.min_edge:
+                print(f"[{profile.display_name}] SKIP '{question[:40]}' - edge {score.edge*100:.1f}% < {profile.min_edge*100:.0f}%")
+                continue
+            if score.score < profile.min_score:
+                continue
+
+            # Sentiment alignment check
+            if profile.require_sentiment_alignment:
+                if score.direction == "yes" and score.news_sentiment < 0:
+                    print(f"[{profile.display_name}] SKIP '{question[:40]}' - sentiment misalignment")
+                    continue
+                if score.direction == "no" and score.news_sentiment > 0:
+                    print(f"[{profile.display_name}] SKIP '{question[:40]}' - sentiment misalignment")
+                    continue
+
+            # Bet size from profile (capped at 10% of bankroll)
+            size_usd = min(profile.bet_size_usd, bankroll * 0.10)
+            if size_usd < 1.0:
+                continue
+
+            # Build reasoning combining Claude + Strategies
+            reasoning = llm_analysis.get("reasoning", "")
+            factors = llm_analysis.get("key_factors", [])
+            if factors:
+                reasoning += " | Factors: " + ", ".join(factors[:3])
+            reasoning += f" | Strategies({consensus['agreeing_strategies']}): {consensus['consensus_reasoning'][:200]}"
+            devil = llm_analysis.get("devils_advocate", "")
+            if devil:
+                reasoning += f" | Risk: {devil[:100]}"
+            reasoning += f" | Verdict: {verdict}"
+
+            # Save analysis
+            analysis_id = None
+            if storage:
+                saved = storage.save_analysis({
+                    "market_id": score.market_id,
+                    "reasoning": reasoning,
+                    "confidence": score.confidence,
+                    "direction": score.direction,
+                    "probability": score.estimated_probability,
+                    "market_price": score.current_price,
+                    "edge": score.edge,
+                    "recommended_action": f"buy_{score.direction}",
+                    "recommended_size": size_usd,
+                    "kelly_fraction": size_usd / bankroll if bankroll > 0 else 0,
+                })
+                analysis_id = saved.get("id")
+
+            # Save trade with profile tag
+            price = score.current_price if score.direction == "yes" else (1 - score.current_price)
+            trade_data = {
+                "market_id": score.market_id,
+                "question": question,
+                "side": "buy",
+                "direction": score.direction,
+                "price": price,
+                "size": size_usd / price if price > 0 else 0,
+                "cost": size_usd,
+                "status": "simulated",
+                "edge": score.edge,
+                "end_date": market.get("endDate"),
+                "reasoning": reasoning,
+                "analysis_id": analysis_id,
+                "profile": profile.name,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+            if storage:
+                storage.save_trade(trade_data)
+                if portfolio:
+                    storage.update_portfolio({
+                        "invested": portfolio["invested"] + size_usd,
+                        "available": portfolio["available"] - size_usd,
+                    }, profile=profile.name)
+
+            await telegram.notify_trade(trade_data, llm_analysis)
+
+            trades_executed += 1
+            print(f"[{profile.display_name}] TRADE #{trades_executed}: {score.direction.upper()} '{question[:50]}' | Conf: {llm_analysis['confidence']:.0%} | Edge: {score.edge*100:.1f}% | ${size_usd:.2f}")
+
+            results.append({
+                "question": question,
+                "direction": score.direction,
+                "edge": score.edge,
+                "confidence": llm_analysis["confidence"],
+                "cost": size_usd,
+                "verdict": verdict,
+            })
+
+        print(f"\n[{profile.display_name}] Done. {trades_executed} trades.")
+        print(f"{'='*60}\n")
+
+        return {
+            "profile": profile.name,
+            "display_name": profile.display_name,
+            "scanned": len(all_markets),
+            "filtered": len(markets),
+            "candidates": len(candidates),
+            "trades": trades_executed,
+            "results": results,
+        }
+
+    finally:
+        await poly_client.close()
+        await pipeline.close()
+
+
+async def run_all_profiles() -> dict:
+    """Run scan for all 3 profiles in sequence."""
+    results = {}
+    for profile in all_profiles():
+        try:
+            results[profile.name] = await run_profile_scan(profile)
+        except Exception as e:
+            print(f"[Scanner] Error in {profile.name}: {e}")
+            results[profile.name] = {"error": str(e)}
+    return results
 
 
 async def run_loop(interval_minutes: int = 30, **kwargs):

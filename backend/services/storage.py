@@ -24,19 +24,36 @@ class StorageService:
 
     # ── Portfolio ──
 
-    def get_portfolio(self) -> dict:
+    def get_portfolio(self, profile: str | None = None) -> dict:
+        """Get portfolio for a specific profile, or default if not specified."""
         self._check()
+        if profile:
+            try:
+                res = self.client.table("portfolio").select("*").eq("profile", profile).limit(1).execute()
+                if res.data:
+                    return res.data[0]
+            except:
+                pass
         res = self.client.table("portfolio").select("*").order("id", desc=True).limit(1).execute()
         if res.data:
             return res.data[0]
         return {"total_balance": 1000, "invested": 0, "available": 1000, "total_pnl": 0, "win_count": 0, "loss_count": 0}
 
-    def update_portfolio(self, updates: dict) -> dict:
+    def get_all_portfolios(self) -> list[dict]:
+        """Get all profile portfolios."""
+        self._check()
+        try:
+            res = self.client.table("portfolio").select("*").execute()
+            return res.data or []
+        except:
+            return []
+
+    def update_portfolio(self, updates: dict, profile: str | None = None) -> dict:
         self._check()
         updates["updated_at"] = datetime.now(timezone.utc).isoformat()
-        portfolio = self.get_portfolio()
+        portfolio = self.get_portfolio(profile=profile)
         self.client.table("portfolio").update(updates).eq("id", portfolio["id"]).execute()
-        return self.get_portfolio()
+        return self.get_portfolio(profile=profile)
 
     # ── Trades ──
 
@@ -63,15 +80,28 @@ class StorageService:
             "edge": trade.get("edge", 0),
             "reasoning": trade.get("reasoning", ""),
         }
+        if trade.get("profile"):
+            extended["profile"] = trade["profile"]
         try:
             res = self.client.table("trades").insert({**row, **extended}).execute()
         except Exception:
-            res = self.client.table("trades").insert(row).execute()
+            try:
+                # Remove profile if it fails
+                extended.pop("profile", None)
+                res = self.client.table("trades").insert({**row, **extended}).execute()
+            except Exception:
+                res = self.client.table("trades").insert(row).execute()
         return res.data[0] if res.data else {**row, **extended}
 
-    def get_trades(self, limit: int = 50) -> list[dict]:
+    def get_trades(self, limit: int = 50, profile: str | None = None) -> list[dict]:
         self._check()
-        res = self.client.table("trades").select("*").order("created_at", desc=True).limit(limit).execute()
+        q = self.client.table("trades").select("*").order("created_at", desc=True).limit(limit)
+        if profile:
+            try:
+                q = q.eq("profile", profile)
+            except:
+                pass
+        res = q.execute()
         return res.data or []
 
     def get_open_trades(self) -> list[dict]:

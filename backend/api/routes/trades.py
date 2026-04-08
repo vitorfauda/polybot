@@ -217,11 +217,11 @@ async def auto_scan_and_trade(
     min_score: float = Query(0.4),
     max_trades: int = Query(3),
     use_llm: bool = Query(True),
-    max_hours: float = Query(36, description="Max hours until expiry (36h = today/tomorrow)"),
-    min_hours: float = Query(1, description="Min hours until expiry (avoid <1h markets)"),
-    bet_size: float = Query(0, description="Fixed bet size (0 = use Kelly)"),
+    max_hours: float = Query(36),
+    min_hours: float = Query(1),
+    bet_size: float = Query(0),
 ):
-    """Auto scan, analyze, and execute trades. Defaults to same-day or next-day markets only."""
+    """Auto scan, analyze, and execute trades."""
     from workers.auto_scanner import run_scan
     result = await run_scan(
         min_edge=min_edge,
@@ -236,3 +236,208 @@ async def auto_scan_and_trade(
     storage = _get_storage()
     portfolio = storage.get_stats() if storage else executor.get_portfolio()
     return {**result, "portfolio": portfolio}
+
+
+@router.post("/scan-profile/{profile_name}")
+async def scan_with_profile(profile_name: str):
+    """Run a scan using a specific trading profile (hunter, sniper, scout)."""
+    from workers.auto_scanner import run_profile_scan
+    from services.profiles import get_profile
+    profile = get_profile(profile_name)
+    if not profile:
+        raise HTTPException(status_code=404, detail=f"Profile '{profile_name}' not found")
+    result = await run_profile_scan(profile)
+    return result
+
+
+@router.post("/scan-all-profiles")
+async def scan_all_profiles():
+    """Run scans for all 3 profiles in sequence."""
+    from workers.auto_scanner import run_all_profiles
+    return await run_all_profiles()
+
+
+@router.get("/profiles")
+async def list_profiles():
+    """List all available trading profiles with their settings and current portfolios."""
+    from services.profiles import all_profiles
+    storage = _get_storage()
+    profiles = []
+    for p in all_profiles():
+        portfolio = None
+        trades = []
+        if storage:
+            try:
+                portfolio = storage.get_portfolio(profile=p.name)
+                trades = storage.get_trades(limit=20, profile=p.name)
+            except:
+                pass
+
+        # Calculate stats
+        wins = sum(1 for t in trades if t.get("status") == "won")
+        losses = sum(1 for t in trades if t.get("status") == "lost")
+        open_count = sum(1 for t in trades if t.get("status") == "simulated")
+        win_rate = round(wins / (wins + losses) * 100, 1) if (wins + losses) > 0 else 0
+
+        profiles.append({
+            "name": p.name,
+            "display_name": p.display_name,
+            "description": p.description,
+            "settings": {
+                "min_edge": p.min_edge,
+                "min_confidence": p.min_claude_confidence,
+                "bet_size": p.bet_size_usd,
+                "max_hours": p.max_hours_to_expiry,
+                "required_verdict": p.required_verdict,
+            },
+            "portfolio": portfolio,
+            "stats": {
+                "total_trades": len(trades),
+                "open": open_count,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": win_rate,
+            },
+            "recent_trades": trades[:5],
+        })
+    return {"profiles": profiles}
+
+
+@router.post("/resolve-all")
+async def resolve_all_trades():
+    """Manually trigger resolution of all expired open trades."""
+    from workers.auto_resolver import resolve_open_trades
+    return await resolve_open_trades()
+
+
+@router.post("/scan-crypto")
+async def scan_crypto_markets(
+    max_markets: int = Query(20),
+    min_edge: float = Query(0.05),
+    bet_size: float = Query(10),
+    execute: bool = Query(False, description="If true, execute trades. If false, just analyze."),
+):
+    """
+    Specialized crypto market scanner.
+    Uses real-time price data, technical indicators, and Claude AI analysis.
+    """
+    from services.polymarket.client import PolymarketClient
+    from services.news.pipeline import NewsPipeline
+    from services.analysis.crypto_strategy import CryptoIntelligence
+    from datetime import datetime, timezone
+
+    poly_client = PolymarketClient()
+    pipeline = NewsPipeline()
+    intel = CryptoIntelligence()
+    storage = _get_storage()
+    telegram = TelegramAlert()
+
+    try:
+        # Fetch markets
+        all_markets = await poly_client.get_active_markets(limit=200)
+
+        # Filter to crypto only
+        crypto_markets = [m for m in all_markets if intel.is_crypto_market(m)]
+        print(f"[CryptoScan] Found {len(crypto_markets)} crypto markets out of {len(all_markets)}")
+
+        results = []
+        executed = 0
+
+        for market in crypto_markets[:max_markets]:
+            question = market.get("question", "")
+
+            # Collect crypto-specific news
+            news = await pipeline.collect_for_market(question, max_results=5)
+
+            # Run full crypto analysis with real data
+            try:
+                analysis = await intel.analyze_crypto_market(market, news)
+            except Exception as e:
+                print(f"[CryptoScan] Error analyzing '{question[:40]}': {e}")
+                continue
+
+            if "error" in analysis:
+                continue
+
+            verdict = analysis.get("claude_verdict", {})
+            recommendation = verdict.get("trade_recommendation", "SKIP")
+
+            # Calculate edge
+            import json as _json
+            prices = market.get("outcomePrices", "[0.5,0.5]")
+            if isinstance(prices, str):
+                try:
+                    prices = _json.loads(prices)
+                except:
+                    prices = [0.5, 0.5]
+            market_yes = float(prices[0]) if prices else 0.5
+
+            claude_prob = verdict.get("probability", market_yes)
+            direction = verdict.get("direction", "yes")
+            edge = (claude_prob - market_yes) if direction == "yes" else ((1 - claude_prob) - (1 - market_yes))
+
+            result_entry = {
+                "question": question,
+                "coin": analysis["coin"],
+                "current_price": analysis["analysis"]["current_price"],
+                "target_price": analysis["analysis"]["target_price"],
+                "distance_pct": analysis["analysis"]["distance_to_target_pct"],
+                "rsi": analysis["analysis"]["rsi"],
+                "technical": analysis["analysis"]["technical_signal"],
+                "market_price": market_yes,
+                "claude_probability": claude_prob,
+                "edge": edge,
+                "direction": direction,
+                "recommendation": recommendation,
+                "reasoning": verdict.get("reasoning", ""),
+                "key_signal": verdict.get("key_signal", ""),
+                "risk": verdict.get("risk", ""),
+            }
+
+            results.append(result_entry)
+
+            # Execute trade if conditions met
+            if execute and recommendation in ("STRONG_BUY", "BUY") and abs(edge) >= min_edge:
+                if executed >= 3:
+                    continue
+                price = market_yes if direction == "yes" else (1 - market_yes)
+                trade_data = {
+                    "market_id": market.get("conditionId", market.get("id", "")),
+                    "question": question,
+                    "side": "buy",
+                    "direction": direction,
+                    "price": price,
+                    "size": bet_size / price if price > 0 else 0,
+                    "cost": bet_size,
+                    "status": "simulated",
+                    "edge": edge,
+                    "end_date": market.get("endDate"),
+                    "reasoning": f"[CRYPTO] {verdict.get('reasoning', '')[:300]} | Signal: {verdict.get('key_signal', '')[:100]} | Risk: {verdict.get('risk', '')[:100]}",
+                    "profile": "crypto_hunter",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+
+                if storage:
+                    storage.save_trade(trade_data)
+                    portfolio = storage.get_portfolio(profile="crypto_hunter")
+                    if portfolio:
+                        storage.update_portfolio({
+                            "invested": portfolio["invested"] + bet_size,
+                            "available": portfolio["available"] - bet_size,
+                        }, profile="crypto_hunter")
+
+                await telegram.notify_trade(trade_data, verdict)
+                executed += 1
+                print(f"[CryptoScan] EXECUTED: {direction.upper()} '{question[:50]}' edge={edge*100:.1f}%")
+
+        return {
+            "scanned": len(all_markets),
+            "crypto_markets_found": len(crypto_markets),
+            "analyzed": len(results),
+            "executed": executed,
+            "results": results,
+        }
+    finally:
+        await poly_client.close()
+        await pipeline.close()
+        await intel.close()
