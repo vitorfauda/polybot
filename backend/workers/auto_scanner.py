@@ -1,7 +1,8 @@
 """Automated scanner - runs periodically to find and execute opportunities."""
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from dateutil import parser as date_parser
 from services.polymarket.client import PolymarketClient
 from services.news.pipeline import NewsPipeline
 from services.analysis.scorer import OpportunityScorer
@@ -13,6 +14,20 @@ from services.telegram_bot import TelegramAlert
 from core.config import get_settings
 
 
+def _hours_until(end_date_str: str | None) -> float | None:
+    """Calculate hours until a market expires."""
+    if not end_date_str:
+        return None
+    try:
+        end = date_parser.parse(end_date_str)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        delta = end - datetime.now(timezone.utc)
+        return delta.total_seconds() / 3600
+    except:
+        return None
+
+
 async def run_scan(
     min_edge: float = 0.10,
     min_score: float = 0.30,
@@ -20,6 +35,8 @@ async def run_scan(
     use_llm: bool = True,
     bankroll: float | None = None,
     bet_size: float | None = None,  # fixed bet size (like the other guy uses $25)
+    max_hours_to_expiry: float = 36,  # only markets expiring within 36h (today/tomorrow)
+    min_hours_to_expiry: float = 1,  # avoid markets expiring in less than 1h
 ):
     """Run a full scan cycle: collect data, analyze, and optionally trade."""
     settings = get_settings()
@@ -42,8 +59,18 @@ async def run_scan(
         print(f"{'='*60}")
 
         # 1. Fetch markets
-        markets = await poly_client.get_active_markets(limit=100)
-        print(f"[Scanner] Markets scanned: {len(markets)}")
+        all_markets = await poly_client.get_active_markets(limit=200)
+        print(f"[Scanner] Total markets fetched: {len(all_markets)}")
+
+        # Filter by expiry time (same day or next day)
+        markets = []
+        for m in all_markets:
+            hours = _hours_until(m.get("endDate"))
+            if hours is None:
+                continue
+            if min_hours_to_expiry <= hours <= max_hours_to_expiry:
+                markets.append(m)
+        print(f"[Scanner] Markets expiring in {min_hours_to_expiry}-{max_hours_to_expiry}h: {len(markets)}")
 
         if storage:
             storage.save_markets(markets)

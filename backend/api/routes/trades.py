@@ -217,8 +217,11 @@ async def auto_scan_and_trade(
     min_score: float = Query(0.4),
     max_trades: int = Query(3),
     use_llm: bool = Query(True),
+    max_hours: float = Query(36, description="Max hours until expiry (36h = today/tomorrow)"),
+    min_hours: float = Query(1, description="Min hours until expiry (avoid <1h markets)"),
+    bet_size: float = Query(0, description="Fixed bet size (0 = use Kelly)"),
 ):
-    """Auto scan, analyze, and execute trades."""
+    """Auto scan, analyze, and execute trades. Defaults to same-day or next-day markets only."""
     from workers.auto_scanner import run_scan
     result = await run_scan(
         min_edge=min_edge,
@@ -226,6 +229,9 @@ async def auto_scan_and_trade(
         max_trades=max_trades,
         use_llm=use_llm,
         bankroll=bankroll,
+        max_hours_to_expiry=max_hours,
+        min_hours_to_expiry=min_hours,
+        bet_size=bet_size if bet_size > 0 else None,
     )
     storage = _get_storage()
     portfolio = storage.get_stats() if storage else executor.get_portfolio()

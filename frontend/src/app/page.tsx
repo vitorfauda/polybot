@@ -212,7 +212,7 @@ export default function Dashboard() {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 300000); // 5 min timeout
       const res = await fetch(
-        `${API_BASE}/api/trades/auto-scan?bankroll=1000&min_edge=0.05&min_score=0.3&max_trades=3&use_llm=true`,
+        `${API_BASE}/api/trades/auto-scan?bankroll=1000&min_edge=0.05&min_score=0.3&max_trades=3&use_llm=true&max_hours=36&min_hours=1`,
         { method: "POST", signal: controller.signal }
       );
       clearTimeout(timeout);
